@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import os
 import sys
 import time
@@ -36,6 +37,7 @@ class WebcamPreview(QtCore.QObject):
         self.width = width
         self.height = height
         self.fps = fps
+        self._capture_api = cv2.CAP_DSHOW if sys.platform.startswith("win") else 0
 
         self._cap = None
         self._timer = QtCore.QTimer(self)
@@ -46,7 +48,7 @@ class WebcamPreview(QtCore.QObject):
             self.status.emit("Webcam: OpenCV nicht installiert.")
             return
 
-        self._cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+        self._cap = cv2.VideoCapture(self.device_index, self._capture_api)
         if not self._cap.isOpened():
             self._cap = None
             self.status.emit("Webcam: konnte nicht geöffnet werden (device_index prüfen).")
@@ -118,7 +120,8 @@ class CaptureWorker(QtCore.QObject):
 
     def _capture_from_webcam(self, out_path: str) -> bool:
         try:
-            cap = cv2.VideoCapture(self._device_index, cv2.CAP_DSHOW)
+            capture_api = cv2.CAP_DSHOW if sys.platform.startswith("win") else 0
+            cap = cv2.VideoCapture(self._device_index, capture_api)
             if not cap.isOpened():
                 return False
 
@@ -168,21 +171,24 @@ class FlashOverlay(QtWidgets.QWidget):
 
 
 class PhotoboxWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, *, device_index: int = 0, base_dir: Optional[str] = None, fullscreen: bool = True, use_webcam: bool = True):
         super().__init__()
 
         # --- Konfiguration (Demo) ---
-        self.device_index = 0
-        base = os.path.dirname(__file__)
+        self.device_index = device_index
+        base = base_dir or os.path.dirname(__file__)
         self.keep_dir = os.path.join(base, "data_keep")
         self.tmp_dir = os.path.join(base, "data_tmp")
+        self._fullscreen = fullscreen
+        self._use_webcam = use_webcam
 
         os.makedirs(self.keep_dir, exist_ok=True)
         os.makedirs(self.tmp_dir, exist_ok=True)
 
         self.setWindowTitle("Photobox – Review Demo (Webcam)")
         self.setStyleSheet("background-color: #0b0b0b; color: white;")
-        self.setCursor(QtCore.Qt.BlankCursor)
+        if self._fullscreen:
+            self.setCursor(QtCore.Qt.BlankCursor)
 
         self._locked = False
         self._thread: Optional[QtCore.QThread] = None
@@ -213,12 +219,20 @@ class PhotoboxWindow(QtWidgets.QMainWindow):
         self.countdown_timer.timeout.connect(self._countdown_tick)
 
         # Webcam preview
-        self.webcam = WebcamPreview(device_index=self.device_index, width=1280, height=720, fps=30)
-        self.webcam.frame_ready.connect(self._on_preview_frame)
-        self.webcam.status.connect(self._set_status)
-        self.webcam.start()
+        self.webcam: Optional[WebcamPreview] = None
+        if self._use_webcam and CV_AVAILABLE:
+            self.webcam = WebcamPreview(device_index=self.device_index, width=1280, height=720, fps=30)
+            self.webcam.frame_ready.connect(self._on_preview_frame)
+            self.webcam.status.connect(self._set_status)
+            self.webcam.start()
+        else:
+            self.lbl_live.setText("Webcam deaktiviert – Dummy-Fotos werden erzeugt.")
+            self._set_status("Webcam deaktiviert oder OpenCV fehlt. Dummy-Fotos werden verwendet.")
 
-        self.showFullScreen()
+        if self._fullscreen:
+            self.showFullScreen()
+        else:
+            self.show()
 
     # ---------- UI ----------
 
@@ -365,11 +379,11 @@ class PhotoboxWindow(QtWidgets.QMainWindow):
             return
         self._locked = True
 
+        if not self._use_webcam or not CV_AVAILABLE:
+            self._set_status("Webcam inaktiv – es wird ein Dummy-Foto erzeugt.")
+
         # Preview stoppen -> Kamera freigeben
-        try:
-            self.webcam.stop()
-        except Exception:
-            pass
+        self._stop_preview()
 
         self.stack.setCurrentWidget(self.page_countdown)
         self.countdown_value = 3
@@ -399,7 +413,7 @@ class PhotoboxWindow(QtWidgets.QMainWindow):
         self._worker = CaptureWorker(
             tmp_dir=self.tmp_dir,
             device_index=self.device_index,
-            use_webcam=True
+            use_webcam=self._use_webcam
         )
         self._worker.moveToThread(self._thread)
 
@@ -442,10 +456,8 @@ class PhotoboxWindow(QtWidgets.QMainWindow):
         self._set_status(msg)
 
         # Preview wieder starten
-        try:
-            self.webcam.start()
-        except Exception:
-            pass
+        self._start_preview()
+        QtCore.QTimer.singleShot(1600, self._return_to_idle)
 
         self._locked = False
 
@@ -493,11 +505,10 @@ class PhotoboxWindow(QtWidgets.QMainWindow):
 
     def _return_to_idle(self) -> None:
         # Preview wieder starten
-        try:
-            self.webcam.start()
-        except Exception:
-            pass
+        self._start_preview()
         self.stack.setCurrentWidget(self.page_idle)
+        if not self._use_webcam or not CV_AVAILABLE:
+            self._set_status("Bereit. Webcam inaktiv – Dummy-Fotos werden erzeugt.")
 
     # ---------- Status ----------
 
@@ -523,23 +534,52 @@ class PhotoboxWindow(QtWidgets.QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        try:
-            self.webcam.stop()
-        except Exception:
-            pass
+        self._stop_preview()
         try:
             if self._thread and self._thread.isRunning():
                 self._thread.quit()
-                self._thread.wait(800)
+                if not self._thread.wait(800):
+                    self._thread.terminate()
+                    self._thread.wait(600)
         except Exception:
             pass
         event.accept()
 
+    def _start_preview(self) -> None:
+        if self.webcam is None:
+            return
+        try:
+            self.webcam.start()
+        except Exception:
+            pass
+
+    def _stop_preview(self) -> None:
+        if self.webcam is None:
+            return
+        try:
+            self.webcam.stop()
+        except Exception:
+            pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Photobox Demo")
+    parser.add_argument("--device", type=int, default=0, help="Webcam device index")
+    parser.add_argument("--base-dir", type=str, default=None, help="Basisverzeichnis für data_keep/data_tmp")
+    parser.add_argument("--windowed", action="store_true", help="Fenster statt Vollbild verwenden")
+    parser.add_argument("--no-webcam", action="store_true", help="Webcam deaktivieren und Dummy-Fotos verwenden")
+    return parser.parse_args()
+
 
 def main() -> None:
+    args = parse_args()
     app = QtWidgets.QApplication(sys.argv)
-    w = PhotoboxWindow()
-    w.show()
+    w = PhotoboxWindow(
+        device_index=args.device,
+        base_dir=args.base_dir,
+        fullscreen=not args.windowed,
+        use_webcam=not args.no_webcam,
+    )
     sys.exit(app.exec_())
 
 
